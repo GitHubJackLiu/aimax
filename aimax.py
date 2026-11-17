@@ -33,7 +33,7 @@ import webview
 
 APP_NAME = "AIMAX"             # 程序标识：数据目录名、单实例互斥体、托盘名（不要带空格）
 TITLE = "AI MAX"               # 窗口标题固定，单实例查找依赖它（不要随站点变化）
-VERSION = "1.1.3"              # 版本号，启动动画与托盘提示里会显示
+VERSION = "1.1.4"              # 版本号，启动动画与托盘提示里会显示
 OLD_APP_NAME = "DeepSeekFloat"  # 旧版数据目录名，首次启动时把数据搬过来
 URL = "https://chat.deepseek.com"
 

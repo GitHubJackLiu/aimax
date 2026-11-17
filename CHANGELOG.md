@@ -1,11 +1,16 @@
 # 变更历史
 
+## v1.1.4
+
+- 下载失败自动退镜像：直连 `github.com` 超时后，依次尝试 ghfast.top / gh-proxy.com /
+  ghproxy.net（可用 config 的 `update_mirror` 覆盖）。
+- 校验加固：镜像返回旧缓存包时按资产 `digest` 直接拒绝，不会装上错误版本。
+
 ## v1.1.3
 
 - 自动更新支持 GitHub Releases：默认从本仓库 latest release 读取版本、说明与资产，
   无需再手工维护清单文件。
 - 「设置更新地址」可填 `owner/repo`、仓库地址、清单直链，或填 `off` 关闭检查。
-- 下载支持一次镜像重试（config 里的 `update_mirror`），应对 GitHub 资产域名不通。
 - 校验优先使用 GitHub 资产自带的 `digest: sha256`。
 
 ## v1.1.2
