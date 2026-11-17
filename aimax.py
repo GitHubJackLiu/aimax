@@ -33,7 +33,7 @@ import webview
 
 APP_NAME = "AIMAX"             # 程序标识：数据目录名、单实例互斥体、托盘名（不要带空格）
 TITLE = "AI MAX"               # 窗口标题固定，单实例查找依赖它（不要随站点变化）
-VERSION = "1.1.5"              # 版本号，启动动画与托盘提示里会显示
+VERSION = "1.1.6"              # 版本号，启动动画与托盘提示里会显示
 OLD_APP_NAME = "DeepSeekFloat"  # 旧版数据目录名，首次启动时把数据搬过来
 URL = "https://chat.deepseek.com"
 
@@ -368,6 +368,13 @@ state = {
     "palette": None,         # 配色缓存（System.Drawing.Color 字典）
     "native_idx": None,       # 复用 pywebview 自带 WebView2 的站点下标
     "title_hold": None,      # 标题栏控件引用（换配色时要挨个改色）
+    # ---- 更新下载进度（标题栏圆环 + 悬停详情面板）----
+    "dl_ind": None,          # 圆形进度按钮（自绘 Panel）
+    "dl_progress": None,     # 下载状态字典（got/total/speed/eta/cancel…）
+    "dl_visible": False,     # 是否正在下载
+    "dl_timer": None,        # 刷新圆环的定时器
+    "dl_popup": None,        # 悬停详情面板（Form）
+    "dl_watch": None,        # 鼠标离开自动收起的定时器
 }
 _lock = threading.Lock()
 
@@ -498,6 +505,10 @@ def apply_chrome_theme() -> None:
             if nav is not None:
                 nav.BackColor = P["bg"]
                 nav.Invalidate()
+            dl = hold.get("dl")
+            if dl is not None:
+                dl.BackColor = P["bg"]
+                dl.Invalidate()
             for key in ("min", "max", "close"):
                 b = hold.get(key)
                 if b is not None:
@@ -2727,6 +2738,12 @@ def add_title_bar(hwnd: int) -> dict:
         btn_max = make_button("\u25a2", "hov")         # ▢ 最大化
         btn_cls = make_button("\u2715", "hov_red")     # ✕ 关闭
 
+        # ---------- 下载进度圆环（吸附在窗口按钮左侧）----------
+        # 常驻显示：空闲是个淡色下载图标（点一下 = 检查更新），
+        # 下载中变成环形进度；悬停弹出详情面板。
+        dl_ind = build_dl_indicator(th, btn_h)
+        state["dl_ind"] = dl_ind
+
         def place(*_):
             w = int(form.ClientSize.Width)
             y = max(0, (bar - btn_h) // 2)
@@ -2734,6 +2751,12 @@ def add_title_bar(hwnd: int) -> dict:
             for b in (btn_cls, btn_max, btn_min):   # 从右往左
                 x -= (b.Width + 1)
                 b.Location = Point(max(0, x), y)
+            # 圆形下载按钮排在三个窗口按钮左边；不下载时整个不占位置
+            if state.get("dl_visible"):
+                ind_w = btn_h
+                x -= (ind_w + 1)
+                dl_ind.Size = Size(ind_w, btn_h)
+                dl_ind.Location = Point(max(0, x), y)
             # 导航按钮钉在最左边，标签条顺延到它右侧
             nav.Size = Size(nav_w, bar)
             strip.Location = Point(nav_w, 0)
@@ -2749,6 +2772,8 @@ def add_title_bar(hwnd: int) -> dict:
                 nav.Invalidate()
             except Exception:
                 pass
+
+        state["relayout"] = place
 
         def on_max(s, e):
             threading.Thread(target=toggle_maximize, daemon=True).start()
@@ -2768,12 +2793,14 @@ def add_title_bar(hwnd: int) -> dict:
 
         form.Controls.Add(nav)
         form.Controls.Add(strip)
+        form.Controls.Add(dl_ind)
         form.Controls.Add(btn_min)
         form.Controls.Add(btn_max)
         form.Controls.Add(btn_cls)
         form.Controls.Add(grip)
         nav.BringToFront()
         strip.BringToFront()
+        dl_ind.BringToFront()
         btn_min.BringToFront()
         btn_max.BringToFront()
         btn_cls.BringToFront()
@@ -2784,6 +2811,7 @@ def add_title_bar(hwnd: int) -> dict:
 
         hold["strip"] = strip
         hold["nav"] = nav
+        hold["dl"] = dl_ind
         hold["close"] = btn_cls
         hold["max"] = btn_max
         hold["min"] = btn_min
@@ -3061,6 +3089,9 @@ def start_tray(cfg: dict) -> None:
         pystray.MenuItem("重新加载页面", _reload),
         pystray.MenuItem("重置窗口位置", _reset),
         pystray.Menu.SEPARATOR,
+        # 版本号：只作展示，点了没反应（置灰不可点）
+        pystray.MenuItem(lambda i: f"{TITLE}  v{VERSION}", lambda i, it: None,
+                         enabled=False),
         pystray.MenuItem("检查更新", _check_update),
         pystray.MenuItem("设置更新地址\u2026", _update_url),
         pystray.Menu.SEPARATOR,
@@ -3421,25 +3452,639 @@ def show_update_dialog(data: dict) -> None:
     form.Show()
 
 
+# ---------------------------------------------------------------- 下载进度
+
+class UpdateCancelled(Exception):
+    """用户在进度窗里点了取消。"""
+
+
+def _fmt_size(n: float) -> str:
+    """1536 -> '1.5 KB'；总量未知（0）时返回 '?'。"""
+    n = float(n or 0)
+    if n <= 0:
+        return "?"
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{int(n)} B" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return "?"
+
+
+def _fmt_secs(sec: float) -> str:
+    sec = int(max(0, sec))
+    if sec < 60:
+        return f"{sec} 秒"
+    if sec < 3600:
+        return f"{sec // 60} 分 {sec % 60} 秒"
+    return f"{sec // 3600} 小时 {(sec % 3600) // 60} 分"
+
+
+def _dl_state() -> dict:
+    st = state.get("dl_progress")
+    if not isinstance(st, dict):
+        st = {"remote": "", "total": 0, "got": 0, "speed": 0.0, "eta": 0.0,
+              "cancel": False, "samples": [], "phase": "downloading",
+              "started": time.time()}
+        state["dl_progress"] = st
+    return st
+
+
+def _dl_update(got: int, total: int) -> None:
+    """下载线程每个 chunk 调一次；只写共享状态，界面由定时器读。"""
+    st = _dl_state()
+    st["got"] = int(got)
+    if total > 0:
+        st["total"] = int(total)
+
+
+def _dl_reset(total: int) -> None:
+    """换下一个镜像重试时，把已下载量清零重算。"""
+    st = _dl_state()
+    st["got"] = 0
+    st["samples"] = []
+    st["speed"] = 0.0
+    st["eta"] = 0.0
+    if total > 0:
+        st["total"] = int(total)
+
+
+def _dl_should_cancel() -> bool:
+    return bool(_dl_state().get("cancel"))
+
+
+def _dl_icon(g, cx: float, cy: float, size: float, color, kind: str = "download") -> None:
+    """16×16 逻辑网格的矢量图标（下载箭头 / 对勾 / 叉）。"""
+    from System.Drawing import PointF, Pen
+    k = size / 16.0
+    pen = Pen(color, max(1.2, size * 0.11))
+    try:
+        def P(x, y):
+            return PointF(cx + x * k, cy + y * k)
+
+        if kind == "download":
+            g.DrawLine(pen, P(0, -5.4), P(0, 2.8))
+            g.DrawLine(pen, P(0, 2.8), P(-3.5, -0.7))
+            g.DrawLine(pen, P(0, 2.8), P(3.5, -0.7))
+            g.DrawLine(pen, P(-4.9, 5.6), P(4.9, 5.6))
+        elif kind == "check":
+            g.DrawLines(pen, [P(-4.6, 0.4), P(-1.2, 3.9), P(4.8, -3.4)])
+        else:      # cross
+            g.DrawLine(pen, P(-3.8, -3.8), P(3.8, 3.8))
+            g.DrawLine(pen, P(-3.8, 3.8), P(3.8, -3.8))
+    finally:
+        pen.Dispose()
+
+
+def build_dl_indicator(th: int, btn_h: int):
+    """
+    标题栏上的「下载」圆形按钮。
+
+    空闲：淡色下载图标；下载中：外圈显示进度弧（浏览器那种）；
+    悬停：按钮下方弹出详情面板（进度条 / 速度 / 剩余 / 取消）。
+    """
+    from System.Windows.Forms import Panel, Cursors, PaintEventArgs
+    from System.Drawing import (
+        Point, Size, Rectangle, RectangleF, Pen, SolidBrush, Color,
+    )
+    from System.Drawing.Drawing2D import SmoothingMode, GraphicsPath
+
+    P = palette()
+    ind = Panel()
+    ind.BackColor = P["bg"]
+    ind.TabStop = False
+    ind.Cursor = Cursors.Hand
+    ind.Size = Size(btn_h, btn_h)
+    ind.Visible = False        # 只在下载更新时出现
+    try:
+        from System.Reflection import BindingFlags as _BF
+        _p = ind.GetType().GetProperty("DoubleBuffered",
+                                       _BF.Instance | _BF.NonPublic)
+        _p.SetValue(ind, True)
+    except Exception:
+        pass
+
+    ui = {"hot": False}
+    ring_w = max(2, int(round(th * 0.115)))
+    icon_s = max(12, int(round(th * 1.0)))     # 与左侧导航图标同尺寸（NAV_ICON 规则）
+
+    def on_paint(s_, e):
+        PP = palette()
+        g = e.Graphics
+        try:
+            g.SmoothingMode = SmoothingMode.AntiAlias
+        except Exception:
+            pass
+        g.Clear(PP["bg"])
+        w, h = ind.Width, ind.Height
+        if ui["hot"]:
+            # 圆形按钮，悬停底色也画成圆（方角底色会显得和图标不搭）
+            pad = max(1, int(round(th * 0.10)))
+            box = RectangleF(pad, pad, w - pad * 2, h - pad * 2)
+            br = SolidBrush(PP["tab_hov"])
+            try:
+                g.FillEllipse(br, box)
+            finally:
+                br.Dispose()
+
+        st = state.get("dl_progress")
+        active = isinstance(st, dict)
+        cx, cy = w / 2.0, h / 2.0
+        color = PP["strong"] if ui["hot"] else PP["fg"]
+
+        if active:
+            inset = ring_w / 2.0 + max(1.0, th * 0.07)
+            rr = min(w, h) / 2.0 - inset
+            box = RectangleF(cx - rr, cy - rr, rr * 2, rr * 2)
+            base = Pen(PP["field"], ring_w)
+            try:
+                g.DrawEllipse(base, box)
+            finally:
+                base.Dispose()
+            pct = _dl_pct(st)
+            arc = Pen(PP["accent"], ring_w)
+            try:
+                if pct < 0:
+                    deg = (time.time() * 210.0) % 360.0
+                    g.DrawArc(arc, box, deg, 96.0)
+                elif pct > 0:
+                    g.DrawArc(arc, box, -90.0, max(2.0, 359.9 * pct))
+            finally:
+                arc.Dispose()
+            _dl_icon(g, cx, cy, icon_s, color, "download")
+        else:
+            _dl_icon(g, cx, cy, icon_s, PP["strong"] if ui["hot"] else PP["dim"])
+
+    # 键盘/高 DPI 安全：面板尺寸可能变，重绘时按实时尺寸算，无需重建
+
+    def on_enter(s_, e):
+        ui["hot"] = True
+        ind.Invalidate()
+        try:
+            _dl_popup_show()
+        except Exception as ex:
+            log(f"dl popup failed: {ex!r}")
+
+    def on_leave(s_, e):
+        ui["hot"] = False
+        ind.Invalidate()
+
+    def on_click(s_, e):
+        st = state.get("dl_progress")
+        if isinstance(st, dict):
+            _dl_popup_show()
+            return
+        # 空闲时点击 = 手动检查更新
+        try:
+            check_update(manual=True)
+        except Exception as ex:
+            log(f"dl indicator click failed: {ex!r}")
+
+    ind.Paint += on_paint
+    ind.MouseEnter += on_enter
+    ind.MouseLeave += on_leave
+    ind.MouseClick += on_click
+    return ind
+
+
+def _dl_widget():
+    """标题栏上的圆形下载按钮（自绘 Panel）；还没建出来时返回 None。"""
+    return state.get("dl_ind")
+
+
+def _dl_popup():
+    return state.get("dl_popup")
+
+
+def _dl_timer_start() -> None:
+    from System.Windows.Forms import Timer as WinTimer
+    t = state.get("dl_timer")
+    if t is None:
+        t = WinTimer()
+        t.Interval = 110
+        t.Tick += _dl_tick
+        state["dl_timer"] = t
+    try:
+        t.Start()
+    except Exception as e:
+        log(f"dl timer start failed: {e!r}")
+
+
+def _dl_timer_stop() -> None:
+    t = state.get("dl_timer")
+    if t is not None:
+        try:
+            t.Stop()
+        except Exception:
+            pass
+
+
+def _dl_speed(st: dict) -> float:
+    """按最近 2.5 秒的采样算平均速度（字节/秒）。"""
+    now = time.time()
+    got = int(st.get("got") or 0)
+    samples = st.get("samples") or []
+    samples.append((now, got))
+    samples = [x for x in samples if now - x[0] <= 2.5][-16:]
+    st["samples"] = samples
+    if len(samples) >= 2:
+        t0, g0 = samples[0]
+        t1, g1 = samples[-1]
+        if t1 - t0 >= 0.3 and g1 >= g0:
+            st["speed"] = (g1 - g0) / (t1 - t0)
+            st["eta"] = (st.get("total", 0) - g1) / st["speed"] if st.get("speed") else 0.0
+    return float(st.get("speed") or 0.0)
+
+
+def _dl_pct(st: dict) -> float:
+    """0..1；总量未知返回 -1（表示画不定量弧）。"""
+    tot = int(st.get("total") or 0)
+    if tot <= 0:
+        return -1.0
+    return max(0.0, min(1.0, int(st.get("got") or 0) / float(tot)))
+
+
+def _dl_tick(sender=None, e=None) -> None:
+    """GUI 线程：刷新圆形进度与悬停面板。"""
+    st = state.get("dl_progress")
+    if not isinstance(st, dict):
+        _dl_timer_stop()
+        return
+    _dl_speed(st)
+    ind = _dl_widget()
+    if ind is not None:
+        try:
+            ind.Invalidate()
+        except Exception:
+            pass
+    pop = _dl_popup()
+    if pop is not None:
+        try:
+            if pop.Visible:
+                pop.Invalidate()
+        except Exception:
+            pass
+
+
+def _dl_begin_ui(remote: str, total: int) -> None:
+    """GUI 线程：开始下载时把圆形按钮切到进度态。"""
+    st = _dl_state()
+    st.update({"remote": str(remote or ""), "total": int(total or 0), "got": 0,
+               "speed": 0.0, "eta": 0.0, "cancel": False, "samples": [],
+               "phase": "downloading", "started": time.time()})
+    state["dl_visible"] = True
+    ind = _dl_widget()
+    if ind is not None:
+        try:
+            ind.Visible = True
+            ind.Invalidate()
+        except Exception:
+            pass
+    rl = state.get("relayout")
+    if rl is not None:
+        try:
+            rl()
+        except Exception:
+            pass
+    _dl_timer_start()
+
+
+def _dl_end_ui() -> None:
+    """GUI 线程：下载结束（成功/失败/取消），圆形按钮隐藏。"""
+    state["dl_progress"] = None
+    state["dl_visible"] = False
+    _dl_timer_stop()
+    _dl_popup_hide()
+    ind = _dl_widget()
+    if ind is not None:
+        try:
+            ind.Visible = False
+            ind.Invalidate()
+        except Exception:
+            pass
+    rl = state.get("relayout")
+    if rl is not None:
+        try:
+            rl()
+        except Exception:
+            pass
+
+
+def _dl_finish() -> None:
+    """工作线程可调：收掉进度界面。"""
+    try:
+        invoke_gui(_dl_end_ui)
+    except Exception:
+        state["dl_progress"] = None
+
+
+# ---------------------------------------------------------------- 悬停详情面板
+
+POPUP_W, POPUP_H = 262, 108
+
+
+def _dl_popup_rects(w, h):
+    """面板里的点击热区（取消按钮）。"""
+    s = ui_scale()
+    bw, bh = int(round(66 * s)), int(round(22 * s))
+    return {"cancel": (w - int(round(12 * s)) - bw,
+                       h - int(round(10 * s)) - bh, bw, bh)}
+
+
+def _dl_popup_build():
+    from System.Windows.Forms import Form, FormBorderStyle, FormStartPosition
+    from System.Drawing import Size as DSize, Color
+    P = palette()
+
+    pop = Form()
+    pop.FormBorderStyle = getattr(FormBorderStyle, "None")
+    pop.ShowInTaskbar = False
+    pop.TopMost = True
+    pop.StartPosition = FormStartPosition.Manual
+    pop.BackColor = P["panel"]
+    pop.ClientSize = DSize(int(round(POPUP_W * ui_scale())), int(round(POPUP_H * ui_scale())))
+
+    def on_paint(s_, e):
+        _dl_popup_paint(pop, e)
+
+    pop.Paint += on_paint
+
+    def on_click(s_, e):
+        w, h = pop.ClientSize.Width, pop.ClientSize.Height
+        r = _dl_popup_rects(w, h)["cancel"]
+        if r is None:
+            return
+        x, y, bw, bh = r
+        if x <= e.X <= x + bw and y <= e.Y <= y + bh:
+            st = state.get("dl_progress")
+            if isinstance(st, dict):
+                st["cancel"] = True
+                log("update: cancel requested (indicator)")
+                pop.Invalidate()
+
+    pop.MouseClick += on_click
+    return pop
+
+
+def _dl_popup_paint(pop, e) -> None:
+    from System.Drawing import Font, FontStyle, Pen, SolidBrush, Rectangle, Color
+    from System.Drawing.Drawing2D import SmoothingMode, GraphicsPath
+
+    P = palette()
+    s = ui_scale()
+
+    def S(v):
+        return int(round(v * s))
+
+    st = state.get("dl_progress")
+    active = isinstance(st, dict)
+    if not active:
+        st = {}
+
+    g = e.Graphics
+    try:
+        g.SmoothingMode = SmoothingMode.AntiAlias
+    except Exception:
+        pass
+    w, h = pop.ClientSize.Width, pop.ClientSize.Height
+    g.Clear(P["panel"])
+
+    pen = Pen(P["edge"], 1)
+    try:
+        g.DrawRectangle(pen, 0, 0, w - 1, h - 1)
+    finally:
+        pen.Dispose()
+
+    try:
+        f_ttl = Font("Segoe UI", UI_FONT_PT, FontStyle.Bold)
+        f_txt = Font("Segoe UI", UI_FONT_PT - 0.5)
+    except Exception:
+        f_ttl = f_txt = None
+
+    def text(t, font, color, x, y):
+        if font is None:
+            return
+        br = SolidBrush(color)
+        try:
+            g.DrawString(t, font, br, float(x), float(y))
+        finally:
+            br.Dispose()
+
+    remote = str(st.get("remote") or "").lstrip("vV")
+    if active:
+        title = f"正在下载  v{remote}" if remote else "正在下载更新"
+    else:
+        title = f"{TITLE}  v{VERSION}"
+    text(title, f_ttl, P["strong"], S(13), S(9))
+
+    tot = int(st.get("total") or 0)
+    got = int(st.get("got") or 0)
+    pct = _dl_pct(st) if active else -1.0
+
+    # 进度条：底槽 + 已下载
+    bx, by, bh = S(13), S(38), S(6)
+    bw = w - S(26)
+    rad = bh / 2.0
+
+    def capsule(x, y, cw, ch, r):
+        p = GraphicsPath()
+        d = r * 2.0
+        p.AddArc(x, y, d, d, 180, 90)
+        p.AddArc(x + cw - d, y, d, d, 270, 90)
+        p.AddArc(x + cw - d, y + ch - d, d, d, 0, 90)
+        p.AddArc(x, y + ch - d, d, d, 90, 90)
+        p.CloseFigure()
+        return p
+
+    slot = SolidBrush(P["field"])
+    try:
+        g.FillPath(slot, capsule(bx, by, bw, bh, rad))
+    finally:
+        slot.Dispose()
+
+    if active:
+        if pct > 0:
+            br = SolidBrush(P["accent"])
+            try:
+                g.FillPath(br, capsule(bx, by, max(bh, bw * pct), bh, rad))
+            finally:
+                br.Dispose()
+        elif pct < 0:
+            seg = bw * 0.3
+            span = bw - seg
+            pos = (time.time() * 0.55) % 2.0
+            x = pos * span if pos <= 1.0 else (2.0 - pos) * span
+            br = SolidBrush(P["accent"])
+            try:
+                g.FillPath(br, capsule(bx + x, by, seg, bh, rad))
+            finally:
+                br.Dispose()
+
+    if active:
+        spd = float(st.get("speed") or 0.0)
+        head = (f"{pct * 100:.0f}%  ·  {_fmt_size(got)} / {_fmt_size(tot)}"
+                if pct >= 0 else f"已下载 {_fmt_size(got)}")
+        text(head, f_txt, P["fg"], S(13), S(50))
+        tail = ""
+        if spd > 0:
+            tail = f"{_fmt_size(spd)}/s"
+            eta = float(st.get("eta") or 0.0)
+            if pct >= 0 and eta > 0:
+                tail += f"  ·  剩余 {_fmt_secs(eta)}"
+        if tail:
+            text(tail, f_txt, P["dim"], S(13), S(68))
+        if st.get("cancel"):
+            text("正在取消…", f_txt, P["dim"], S(13), S(68))
+
+        # 取消按钮
+        x, y, cbw, cbh = _dl_popup_rects(w, h)["cancel"]
+        bpen = Pen(P["edge"], 1)
+        try:
+            g.DrawRectangle(bpen, x, y, cbw - 1, cbh - 1)
+        finally:
+            bpen.Dispose()
+        canceling = bool(st.get("cancel"))
+        text("取消中" if canceling else "取消下载", f_txt,
+             P["dim"] if canceling else P["fg"], x + S(12), y + S(3))
+    else:
+        text("点击圆形按钮检查更新", f_txt, P["dim"], S(13), S(50))
+        text(f"当前版本 v{VERSION} · 检查 GitHub Releases", f_txt, P["dim"], S(13), S(68))
+
+    if f_ttl is not None:
+        try:
+            f_ttl.Dispose()
+            f_txt.Dispose()
+        except Exception:
+            pass
+
+
+def _dl_popup_watch_tick(sender=None, e=None) -> None:
+    """鼠标离开按钮与面板后自动收起。"""
+    from System.Windows.Forms import Cursor
+    pop = _dl_popup()
+    ind = _dl_widget()
+    if pop is None or not pop.Visible:
+        t = state.get("dl_watch")
+        if t is not None:
+            try:
+                t.Stop()
+            except Exception:
+                pass
+        return
+    try:
+        cp = Cursor.Position
+        inside = False
+        for c in (ind, pop):
+            if c is None:
+                continue
+            r = c.RectangleToScreen(c.ClientRectangle)
+            if r.Contains(cp):
+                inside = True
+                break
+        if not inside:
+            _dl_popup_hide()
+    except Exception as e:
+        log(f"dl popup watch failed: {e!r}")
+        _dl_popup_hide()
+
+
+def _dl_popup_hide() -> None:
+    pop = _dl_popup()
+    if pop is not None:
+        try:
+            if pop.Visible:
+                pop.Hide()
+        except Exception:
+            pass
+    t = state.get("dl_watch")
+    if t is not None:
+        try:
+            t.Stop()
+        except Exception:
+            pass
+
+
+def _dl_popup_show() -> None:
+    """在圆形按钮下方弹出详情面板（右对齐）。"""
+    from System.Drawing import Point as DPoint
+    from System.Windows.Forms import Timer as WinTimer
+
+    ind = _dl_widget()
+    form = state.get("form")
+    if ind is None or form is None:
+        return
+    pop = _dl_popup()
+    if pop is None:
+        pop = _dl_popup_build()
+        state["dl_popup"] = pop
+
+    try:
+        p = ind.PointToScreen(DPoint(0, 0))
+        fr = form.RectangleToScreen(form.ClientRectangle)
+        w, h = pop.ClientSize.Width, pop.ClientSize.Height
+        # 右对齐到窗口右边（浏览器下载面板的习惯位置）
+        x = fr.Right - w - int(round(6 * ui_scale()))
+        y = p.Y + ind.Height + int(round(4 * ui_scale()))
+        try:
+            left, top, right, bottom = monitor_work_area(int(p.X), int(p.Y))
+            x = max(left + 4, min(x, right - w - 4))
+            y = max(top + 4, min(y, bottom - h - 4))
+        except Exception:
+            pass
+        pop.Location = DPoint(int(x), int(y))
+    except Exception as e:
+        log(f"dl popup place failed: {e!r}")
+
+    try:
+        if not pop.Visible:
+            pop.Show()
+        pop.BringToFront()
+        pop.Invalidate()
+    except Exception as e:
+        log(f"dl popup show failed: {e!r}")
+
+    t = state.get("dl_watch")
+    if t is None:
+        t = WinTimer()
+        t.Interval = 120
+        t.Tick += _dl_popup_watch_tick
+        state["dl_watch"] = t
+    try:
+        t.Start()
+    except Exception:
+        pass
+
+
+
 def start_download(data: dict) -> None:
     toast("正在下载新版本…")
     threading.Thread(target=_download_worker, args=(dict(data),),
                      daemon=True, name="update-download").start()
 
 
-def _fetch_file(url: str, path: str, timeout: float = 30.0) -> str:
+def _fetch_file(url: str, path: str, timeout: float = 30.0,
+                on_progress=None, should_cancel=None) -> str:
     """把 url 下载到 path，返回 sha256 十六进制。空响应按失败处理。"""
     import hashlib
     h = hashlib.sha256()
     got = 0
     with _open_url_stream(url, timeout=timeout) as r, open(path, "wb") as f:
+        try:
+            total = int(r.headers.get("Content-Length") or 0)
+        except Exception:
+            total = 0
+        if on_progress:
+            on_progress(0, total)
         while True:
-            chunk = r.read(128 * 1024)
+            if should_cancel and should_cancel():
+                raise UpdateCancelled("user cancelled")
+            chunk = r.read(64 * 1024)
             if not chunk:
                 break
             f.write(chunk)
             h.update(chunk)
             got += len(chunk)
+            if on_progress:
+                on_progress(got, total)
     if got <= 0:
         raise RuntimeError("空响应")
     log(f"update: fetched {got} bytes")
@@ -3452,6 +4097,12 @@ def _download_worker(data: dict) -> None:
         log("update: manifest has no url")
         toast("更新清单里没有下载地址")
         return
+
+    remote = str(data.get("version") or "").strip().lstrip("vV")
+    try:
+        expected = int(data.get("size") or 0)
+    except Exception:
+        expected = 0
 
     d = os.path.join(tempfile.gettempdir(), "AIMAX-update")
     try:
@@ -3470,24 +4121,44 @@ def _download_worker(data: dict) -> None:
         if cand not in seen:
             seen.append(cand)
 
+    state["dl_progress"] = None          # 清掉上一轮残留
+    invoke_gui(lambda: _dl_begin_ui(remote, expected))
+
     digest = ""
     err = None
     for i, u in enumerate(seen):
         try:
             log(f"update: downloading [{i + 1}/{len(seen)}] {u}")
-            digest = _fetch_file(u, raw_path, timeout=12.0 if i == 0 else 90.0)
+            if i > 0:
+                _dl_reset(expected)      # 换镜像重来，进度清零
+            digest = _fetch_file(u, raw_path,
+                                 timeout=12.0 if i == 0 else 90.0,
+                                 on_progress=_dl_update,
+                                 should_cancel=_dl_should_cancel)
             break
+        except UpdateCancelled:
+            log("update: cancelled by user")
+            _dl_finish()
+            toast("已取消本次更新")
+            return
         except Exception as e:
             err = e
             log(f"update download failed ({u}): {e!r}")
+            if _dl_should_cancel():
+                log("update: cancelled by user")
+                _dl_finish()
+                toast("已取消本次更新")
+                return
     if not digest:
         log(f"update download gave up: {err!r}")
+        _dl_finish()
         toast("下载新版本失败，请稍后再试")
         return
 
     want = str(data.get("sha256") or "").strip().lower()
     if want and digest != want:
         log(f"update: sha256 mismatch {digest} != {want}")
+        _dl_finish()
         toast("下载文件校验失败，已放弃本次更新")
         return
 
@@ -3506,9 +4177,11 @@ def _download_worker(data: dict) -> None:
             os.replace(raw_path, new_exe)
     except Exception as e:
         log(f"update unpack failed: {e!r}")
+        _dl_finish()
         toast("更新包内容不对，已放弃本次更新")
         return
 
+    _dl_finish()
     apply_update(new_exe)
 
 

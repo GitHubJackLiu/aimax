@@ -10,3 +10,11 @@ dist_new/
 app_old.ico
 aimax_selftest/
 dl_test/
+prog_test_data/
+selftest_v*/
+prog_test.py
+dlg_test.py
+_dl_block.py
+_dl_ind.py
+shot_*.png
+zoom_*.png
