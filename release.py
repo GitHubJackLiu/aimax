@@ -84,6 +84,18 @@ def publish(ver: str, zip_path: str) -> None:
         raise SystemExit("缺少 GH_TOKEN")
 
     tag = f"v{ver}"
+    # 同名 tag 已经存在时 GitHub 会回 422，所以先把旧的 release/tag 清掉，保证可重复执行
+    try:
+        old = api(f"/repos/{REPO}/releases/tags/{tag}", token)
+        api(f"/repos/{REPO}/releases/{old['id']}", token, "DELETE")
+        print(f"清理旧 release: {tag} (#{old['id']})")
+    except Exception:
+        pass
+    try:
+        api(f"/repos/{REPO}/git/refs/tags/{tag}", token, "DELETE")
+    except Exception:
+        pass
+
     rel = api(f"/repos/{REPO}/releases", token, "POST", {
         "tag_name": tag,
         "name": f"AI MAX {tag}",

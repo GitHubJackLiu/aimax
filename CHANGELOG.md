@@ -1,5 +1,13 @@
 # 变更历史
 
+## v1.1.5
+
+- **修复网页下载不落地**：pywebview 的 `ALLOW_DOWNLOADS` 默认 False，会在
+  `DownloadStarting` 里直接 `Cancel`——表现是点保存、选了路径，最后没有文件。
+  现在由自己接管：另存为对话框（默认上次保存目录）→ 交给 WebView2 写盘 → 完成/失败都有提示。
+- 下载事件挂在每一个标签的 WebView2 上（包括复用 pywebview 的那个），
+  不再出现「只有某个标签能下载」。
+
 ## v1.1.4
 
 - 下载失败自动退镜像：直连 `github.com` 超时后，依次尝试 ghfast.top / gh-proxy.com /

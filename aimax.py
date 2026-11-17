@@ -33,7 +33,7 @@ import webview
 
 APP_NAME = "AIMAX"             # 程序标识：数据目录名、单实例互斥体、托盘名（不要带空格）
 TITLE = "AI MAX"               # 窗口标题固定，单实例查找依赖它（不要随站点变化）
-VERSION = "1.1.4"              # 版本号，启动动画与托盘提示里会显示
+VERSION = "1.1.5"              # 版本号，启动动画与托盘提示里会显示
 OLD_APP_NAME = "DeepSeekFloat"  # 旧版数据目录名，首次启动时把数据搬过来
 URL = "https://chat.deepseek.com"
 
@@ -890,6 +890,7 @@ def _hook_view(core) -> None:
         log(f"hook new window failed: {e!r}")
 
     _hook_nav_events(core)
+    _hook_downloads(core, "created")
 
 
 _nav_hooked = set()      # 已挂过导航事件的 CoreWebView2（用 id 记，对象生命周期与进程相同）
@@ -942,6 +943,145 @@ def _clear_splash_history(core) -> None:
         log("history reset: splash entry removed")
     except Exception as e:
         log(f"history reset failed: {e!r}")
+
+
+# ---------------------------------------------------------------- 网页下载
+#
+# pywebview 的 ALLOW_DOWNLOADS 默认是 False，遇到下载直接 args.Cancel = True ——
+# 表现就是「点了保存、也选了路径，但什么文件都没落地」。所以这里自己接管：
+#   1) 打开 ALLOW_DOWNLOADS，让它别拦；
+#   2) 换掉它自带的 on_download_starting（否则会连弹两个另存为）；
+#   3) 每个 CoreWebView2 都挂 DownloadStarting：问路径 → 写进 ResultFilePath → 完成提示。
+#
+# 另外记一份「上次保存到哪」，下次默认打开那个目录，省得每次都翻。
+
+_dl_hooked = set()     # 已挂过 DownloadStarting 的 CoreWebView2（按 id 记）
+
+
+def downloads_dir() -> str:
+    """系统「下载」文件夹，读不到就退回 ~/Downloads。"""
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+        ) as k:
+            return str(winreg.QueryValueEx(k, "{374DE290-123F-4565-9164-39C4925E467B}")[0])
+    except Exception:
+        return os.path.join(os.path.expanduser("~"), "Downloads")
+
+
+def ask_save_path(suggested: str):
+    """另存为对话框。返回绝对路径；用户取消返回 None。"""
+    name = os.path.basename(str(suggested or "").split("?")[0]) or "download.bin"
+
+    auto = str(os.environ.get("AIMAX_DL_AUTOSAVE") or "").strip()
+    if auto:                       # 自动化测试用：不问，直接落到指定目录
+        os.makedirs(auto, exist_ok=True)
+        return os.path.join(auto, name)
+
+    from System.Windows.Forms import SaveFileDialog, DialogResult
+
+    dlg = SaveFileDialog()
+    dlg.Title = "保存文件"
+    dlg.FileName = name
+    start = str(load_config().get("save_dir") or "").strip() or downloads_dir()
+    if os.path.isdir(start):
+        dlg.InitialDirectory = start
+    ext = os.path.splitext(name)[1].lower().lstrip(".")
+    if ext:
+        dlg.Filter = f"{ext.upper()} 文件 (*.{ext})|*.{ext}|所有文件 (*.*)|*.*"
+    else:
+        dlg.Filter = "所有文件 (*.*)|*.*"
+    dlg.RestoreDirectory = True
+    dlg.OverwritePrompt = True
+
+    form = state.get("form")
+    try:
+        res = dlg.ShowDialog(form) if form is not None else dlg.ShowDialog()
+    except Exception as e:
+        log(f"save dialog failed: {e!r}")
+        return None
+    if res != DialogResult.OK:
+        return None
+    path = str(dlg.FileName or "").strip()
+    if not path:
+        return None
+    cfg = load_config()
+    cfg["save_dir"] = os.path.dirname(path)
+    save_config(cfg)
+    return path
+
+
+def on_download_starting(args) -> None:
+    """接管一次下载：挑路径 → 交给 WebView2 写 → 完成/中断都记日志并提示。"""
+    try:
+        op = args.DownloadOperation
+        path = ask_save_path(str(args.ResultFilePath or ""))
+        if not path:
+            args.Cancel = True
+            log("download: cancelled by user")
+            return
+        args.Handled = True                 # 关掉 WebView2 自带的下载条
+        args.ResultFilePath = path
+        log(f"download -> {path}")
+
+        def on_state(sender, e):
+            try:
+                st = str(op.State)
+                if "Completed" in st:
+                    log(f"download done: {path} exists={os.path.exists(path)}")
+                    toast(f"已保存 {os.path.basename(path)}")
+                elif "Interrupted" in st:
+                    log(f"download interrupted: {op.InterruptedKind}")
+                    toast("下载失败，请重试")
+            except Exception as ex:
+                log(f"download state failed: {ex!r}")
+
+        _view_hooks.append(on_state)
+        op.StateChanged += on_state
+    except Exception as e:
+        log(f"download handling failed: {e!r}")
+        try:
+            args.Cancel = True
+        except Exception:
+            pass
+
+
+def _hook_downloads(core, tag: str = "view") -> None:
+    key = id(core)
+    if key in _dl_hooked:
+        return
+    _dl_hooked.add(key)
+
+    def on_starting(sender, args):
+        on_download_starting(args)
+
+    _view_hooks.append(on_starting)
+    try:
+        core.DownloadStarting += on_starting
+        log(f"download hook ready ({tag})")
+    except Exception as e:
+        log(f"hook DownloadStarting failed: {e!r}")
+
+
+_pv_patched = False    # pywebview 自带的下载回调是否已换成我们的
+
+
+def patch_pywebview_download() -> None:
+    """把 pywebview 自带的 on_download_starting 换成我们的，避免两个对话框。"""
+    global _pv_patched
+    try:
+        from webview.platforms import edgechromium as _ec
+        # pywebview 6.x 里宿主类叫 EdgeChrome（老版本叫 BrowserView），两个都试一下
+        cls = getattr(_ec, "EdgeChrome", None) or getattr(_ec, "BrowserView", None)
+        if cls is None:
+            raise AttributeError("找不到 edgechromium 宿主类")
+        cls.on_download_starting = lambda self, sender, args: on_download_starting(args)
+        _pv_patched = True
+        log(f"pywebview download handler replaced ({cls.__name__})")
+    except Exception as e:
+        log(f"patch pywebview download failed: {e!r}")
 
 
 def _navigate(view, url: str) -> None:
@@ -1027,8 +1167,12 @@ def _view_for(idx: int):
                 if native.CoreWebView2 is not None:
                     state["native_idx"] = idx
                     site_views[idx] = native
-                    # 复用 pywebview 的控件，同样要挂导航事件，否则后退/前进按钮不刷新
+                    # 复用 pywebview 的控件，同样要挂导航事件，否则后退/前进按钮不刷新。
+                    # 下载不用再挂：pywebview 自己的 DownloadStarting 已经被换成我们的回调了，
+                    # 再挂一次会「问两遍路径、存两次」。
                     _hook_nav_events(native.CoreWebView2)
+                    if not _pv_patched:
+                        _hook_downloads(native.CoreWebView2, "native")
                     return native
             except Exception:
                 pass
@@ -3934,6 +4078,16 @@ def _deferred_setup(hwnd: int | None, cfg: dict) -> None:
 
     log("setup done")
 
+    # 自测用：AIMAX_TEST_SWITCH=<站点下标> 时，启动几秒后自动切到该站点。
+    # 用来验证「新建的标签（非 pywebview 自带控件）下载能不能落地」，平时不会触发。
+    test_switch = str(os.environ.get("AIMAX_TEST_SWITCH") or "").strip()
+    if test_switch.isdigit():
+        def _later(idx=int(test_switch)):
+            time.sleep(5.0)
+            invoke_gui(lambda: show_site(idx))
+            log(f"test switch -> [{idx}]")
+        threading.Thread(target=_later, daemon=True, name="test-switch").start()
+
 
 def main() -> None:
     # 更新助手模式：由上一个版本拉起，只负责覆盖 exe 再启动，不初始化界面
@@ -3966,6 +4120,11 @@ def main() -> None:
     # 网页里 target=_blank / window.open 的链接不要丢给系统浏览器，
     # 留在本工具里打开（pywebview 内部会导航到同一个 WebView）
     webview.settings['OPEN_EXTERNAL_LINKS_IN_BROWSER'] = False
+
+    # 关键：pywebview 默认禁止下载，会把 DownloadStarting 直接 Cancel 掉，
+    # 于是「点保存、选了路径、但没文件」。放开后由自己的 handler 接管。
+    webview.settings['ALLOW_DOWNLOADS'] = True
+    patch_pywebview_download()
 
     win = webview.create_window(
         TITLE,
