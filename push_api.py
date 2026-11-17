@@ -70,11 +70,18 @@ def main() -> None:
         f"/repos/{REPO}/git/trees/{base_tree}?recursive=1", tok)["tree"] if e["type"] == "blob"}
 
     changed = []
-    for path in tracked():
+    local_paths = tracked()
+    for path in local_paths:
         local = blob_sha(path)
         if remote.get(path) != local:
             changed.append((path, local))
-    if not changed:
+
+    # 本地已不跟踪、但远端树里还留着的文件——必须显式删掉，否则会一直积累
+    gone = [p for p in remote if p not in set(local_paths)]
+    for p in gone:
+        print(f"delete: {p}")
+
+    if not changed and not gone:
         print("远端已是最新，无需推送")
         return
 
@@ -87,6 +94,9 @@ def main() -> None:
         })
         entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
         print(f"blob  : {path}  ({len(raw)} bytes)")
+
+    for p in gone:
+        entries.append({"path": p, "mode": "100644", "type": "blob", "sha": None})
 
     tree = api(f"/repos/{REPO}/git/trees", tok, "POST",
                {"base_tree": base_tree, "tree": entries})
