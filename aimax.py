@@ -33,7 +33,7 @@ import webview
 
 APP_NAME = "AIMAX"             # 程序标识：数据目录名、单实例互斥体、托盘名（不要带空格）
 TITLE = "AI MAX"               # 窗口标题固定，单实例查找依赖它（不要随站点变化）
-VERSION = "1.1.6"              # 版本号，启动动画与托盘提示里会显示
+VERSION = "1.1.7"              # 版本号，启动动画与托盘提示里会显示
 OLD_APP_NAME = "DeepSeekFloat"  # 旧版数据目录名，首次启动时把数据搬过来
 URL = "https://chat.deepseek.com"
 
@@ -1996,6 +1996,7 @@ def toggle_window() -> None:
         return
     if window_visible():
         close_popup_menu()
+        _dl_popup_hide_async()
         win.hide()
     else:
         win.show()
@@ -2025,6 +2026,7 @@ def minimize_to_tray() -> None:
     if not win:
         return
     close_popup_menu()
+    _dl_popup_hide_async()
     ah = state.get("autohide")
     if ah and ah.hidden:
         ah.force_expand()      # 先复位，否则下次唤出窗口还停在屏幕外
@@ -4001,6 +4003,16 @@ def _dl_popup_hide() -> None:
             t.Stop()
         except Exception:
             pass
+
+
+def _dl_popup_hide_async() -> None:
+    """窗口被隐藏/最小化时也从任意线程收面板（跨线程直接 Hide 不安全）。"""
+    if state.get("dl_popup") is None:
+        return
+    try:
+        invoke_gui(_dl_popup_hide)
+    except Exception:
+        pass
 
 
 def _dl_popup_show() -> None:
