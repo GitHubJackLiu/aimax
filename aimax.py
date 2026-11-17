@@ -33,7 +33,7 @@ import webview
 
 APP_NAME = "AIMAX"             # 程序标识：数据目录名、单实例互斥体、托盘名（不要带空格）
 TITLE = "AI MAX"               # 窗口标题固定，单实例查找依赖它（不要随站点变化）
-VERSION = "1.1.7"              # 版本号，启动动画与托盘提示里会显示
+VERSION = "1.1.8"              # 版本号，启动动画与托盘提示里会显示
 OLD_APP_NAME = "DeepSeekFloat"  # 旧版数据目录名，首次启动时把数据搬过来
 URL = "https://chat.deepseek.com"
 
@@ -3357,7 +3357,24 @@ def show_update_dialog(data: dict) -> None:
     remote = str(data.get("version") or "").strip()
     notes = str(data.get("notes") or "").strip()
 
-    W, H = S(400), S(206)
+    W = S(400)
+    body = notes if notes else "（没有提供更新说明）"
+    if len(body) > 400:
+        body = body[:400] + "…"
+
+    # 说明按对话框宽度折行后的实际高度——原来写死 64px，长说明会被裁成一行看不全
+    body_h = S(64)
+    try:
+        from System.Windows.Forms import TextRenderer, TextFormatFlags
+        _f = Font("Segoe UI", UI_FONT_PT, FontStyle.Regular)
+        _m = TextRenderer.MeasureText(body, _f, Size(W - S(40), 0),
+                                      TextFormatFlags.WordBreak)
+        body_h = max(S(20), min(S(200), _m.Height + S(4)))
+    except Exception as e:
+        log(f"update dialog measure failed: {e!r}")
+
+    H = max(S(206), S(74) + body_h + S(14) + S(32) + S(20))
+
     form = Form()
     form.FormBorderStyle = getattr(FormBorderStyle, "None")
     form.StartPosition = FormStartPosition.CenterScreen
@@ -3391,22 +3408,22 @@ def show_update_dialog(data: dict) -> None:
     form.Controls.Add(ttl)
 
     cur = Label()
-    cur.Text = f"当前版本 v{VERSION}"
+    _size = int(data.get("size") or 0)
+    cur.Text = (f"当前版本 v{VERSION}   ·   安装包 {_fmt_size(_size)}"
+                if _size > 0 else f"当前版本 v{VERSION}")
     cur.ForeColor = P["dim"]
     cur.BackColor = Color.Transparent
     cur.Location = Point(S(20), S(46))
     cur.Size = Size(W - S(40), S(20))
     form.Controls.Add(cur)
 
-    body = notes if notes else "（没有提供更新说明）"
-    if len(body) > 220:
-        body = body[:220] + "…"
     txt = Label()
     txt.Text = body
     txt.ForeColor = P["fg"]
     txt.BackColor = Color.Transparent
+    txt.AutoSize = False
     txt.Location = Point(S(20), S(74))
-    txt.Size = Size(W - S(40), S(64))
+    txt.Size = Size(W - S(40), body_h)
     form.Controls.Add(txt)
 
     def mk(text, primary):
