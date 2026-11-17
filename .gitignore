@@ -1,0 +1,10 @@
+.venv/
+build/
+dist/
+__pycache__/
+*.pyc
+aimax.py.bak.*
+icon_preview.png
+.gh_token
+dist_new/
+app_old.ico
