@@ -32,12 +32,15 @@ def app_version() -> str:
 
 
 def build_zip(ver: str) -> tuple[str, str]:
-    # dist/AIMAX.exe 可能正被运行中的旧版本占用，所以也接受 dist_new/ 里的产物
-    cands = [os.path.join(ROOT, "dist", "AIMAX.exe"),
-             os.path.join(ROOT, "dist_new", "AIMAX.exe")]
-    exe = next((p for p in cands if os.path.exists(p)), "")
-    if not exe:
+    # dist/AIMAX.exe 可能正被运行中的旧版本占用，所以也接受 dist_new/ 里的产物；
+    # 两个都在时取 mtime 更新的那个，避免把旧 exe 打进新版本包里。
+    cands = [p for p in (os.path.join(ROOT, "dist", "AIMAX.exe"),
+                         os.path.join(ROOT, "dist_new", "AIMAX.exe"))
+             if os.path.exists(p)]
+    if not cands:
         raise SystemExit("先构建：python -m PyInstaller AIMAX.spec --noconfirm")
+    exe = max(cands, key=os.path.getmtime)
+    print(f"exe     : {exe}  ({os.path.getsize(exe)} bytes)")
     out = os.path.join(ROOT, "dist_new", f"AIMAX-v{ver}-win64.zip")
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         z.write(exe, "AIMAX.exe")

@@ -76,8 +76,15 @@ python -m venv .venv
 ```
 
 配置落在 `%APPDATA%\AIMAX\config.json`，键名 `update_url`。
-GitHub 资产域名在部分网络下较慢，可在 config 里加 `"update_mirror": "https://your-proxy"`，
-下载失败时会自动用「镜像前缀 + 原始地址」重试一次。
+
+**关于国内网络**：`api.github.com`（查版本）通常能直连，`github.com/.../releases/download/...`
+（下包）经常被卡住。所以下载时会先试直连，失败后自动依次尝试内置加速前缀
+（`UPDATE_MIRRORS`：ghfast.top / gh-proxy.com / ghproxy.net），全部失败才报错。
+包内容用 GitHub 资产自带的 `sha256` 校验，镜像改包会被直接拒绝。
+想换成自己的加速服务，在 config 里加 `"update_mirror": "https://your-proxy"` 即可（优先于内置列表）。
+
+同理，`git push` 在某些网络下也连不上 `github.com`，可用 `python push_api.py "说明"`
+走 REST 接口推送（等价于一次 commit，不经过 git 传输层）。
 
 ## 目录
 

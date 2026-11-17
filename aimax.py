@@ -2987,6 +2987,14 @@ def geometry_monitor() -> None:
 UPDATE_SOURCE = "GitHubJackLiu/aimax"    # 内置更新源：owner/repo
 GH_API = "https://api.github.com"
 
+# 实测：api.github.com 国内可直连，但 github.com/…/releases/download/… 常被卡住。
+# 下载失败时按顺序试这些公共加速前缀（内容有 sha256 校验，被改包会直接拒绝）。
+UPDATE_MIRRORS = (
+    "https://ghfast.top/",
+    "https://gh-proxy.com/",
+    "https://ghproxy.net/",
+)
+
 UPDATE_CHECK_DELAY = 6.0      # 启动后延迟检查，先让页面加载完
 
 
@@ -3309,18 +3317,21 @@ def _download_worker(data: dict) -> None:
     ext = ".zip" if url.lower().split("?")[0].endswith(".zip") else ".exe"
     raw_path = os.path.join(d, "download" + ext)
 
-    # GitHub 资产域名在部分网络下不通，可用 config 里的 update_mirror 配一个加速前缀
-    mirror = str(load_config().get("update_mirror") or "").strip()
-    urls = [url]
-    if mirror:
-        urls.append(mirror.rstrip("/") + "/" + url)
+    # 直连 github.com 常被卡住：失败后依次退到 config 里的 update_mirror 和内置加速前缀
+    seen = []
+    for pre in ([str(load_config().get("update_mirror") or "").strip()]
+                + list(UPDATE_MIRRORS)):
+        pre = pre.strip().rstrip("/")
+        cand = url if not pre else pre + "/" + url
+        if cand not in seen:
+            seen.append(cand)
 
     digest = ""
     err = None
-    for u in urls:
+    for i, u in enumerate(seen):
         try:
-            log(f"update: downloading {u}")
-            digest = _fetch_file(u, raw_path)
+            log(f"update: downloading [{i + 1}/{len(seen)}] {u}")
+            digest = _fetch_file(u, raw_path, timeout=12.0 if i == 0 else 90.0)
             break
         except Exception as e:
             err = e
