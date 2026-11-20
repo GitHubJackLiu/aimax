@@ -33,7 +33,7 @@ import webview
 
 APP_NAME = "AIMAX"             # 程序标识：数据目录名、单实例互斥体、托盘名（不要带空格）
 TITLE = "AI MAX"               # 窗口标题固定，单实例查找依赖它（不要随站点变化）
-VERSION = "1.1.8"              # 版本号，启动动画与托盘提示里会显示
+VERSION = "1.1.9"              # 版本号，启动动画与托盘提示里会显示
 OLD_APP_NAME = "DeepSeekFloat"  # 旧版数据目录名，首次启动时把数据搬过来
 URL = "https://chat.deepseek.com"
 
@@ -2061,11 +2061,12 @@ def apply_topmost(hwnd: int | None, on: bool) -> None:
 
 def set_on_top(value: bool) -> None:
     state["on_top"] = bool(value)
-    apply_topmost(state["hwnd"], bool(value))
+    # 最大化期间不置顶（否则铺满整屏会把别的窗口全遮住），设置值先记着，还原时生效
+    apply_topmost(state["hwnd"], bool(value) and not state.get("maximized"))
     cfg = load_config()
     cfg["on_top"] = bool(value)
     save_config(cfg)
-    log(f"on_top -> {value}")
+    log(f"on_top -> {value}" + ("（最大化中，暂不生效）" if state.get("maximized") else ""))
 
 
 def reload_page() -> None:
@@ -2907,13 +2908,15 @@ def toggle_maximize() -> None:
         user32.SetWindowPos(wt.HWND(hwnd), wt.HWND(0),
                             int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3]), flags)
         state["maximized"] = False
+        # 还原后回到「窗口置顶」设置值（最大化期间是被强制撤掉的）
+        apply_topmost(hwnd, bool(state.get("on_top", True)))
+        log(f"restore -> {rect} topmost={bool(state.get('on_top', True))}")
         ah = state.get("autohide")
         if ah:
             # 还原后的位置可能又贴着屏幕顶边，先别急着自动收起，
             # 否则用户会觉得"点了还原没反应"。等他碰过窗口再离开才收。
             ah.armed = False
             ah.outside_since = None
-        log(f"restore -> {rect}")
     else:
         ah = state.get("autohide")
         if ah and ah.hidden:
@@ -2923,7 +2926,10 @@ def toggle_maximize() -> None:
         user32.SetWindowPos(wt.HWND(hwnd), wt.HWND(0),
                             ml, mt, mr - ml, mb - mt, flags)
         state["maximized"] = True
-        log(f"maximize -> ({ml},{mt}) {mr - ml}x{mb - mt}")
+        # 最大化等于铺满整屏，此时还置顶会把桌面上的其他窗口全挡死：
+        # 撤掉置顶，等还原再按「窗口置顶」设置恢复。
+        apply_topmost(hwnd, False)
+        log(f"maximize -> ({ml},{mt}) {mr - ml}x{mb - mt} topmost=False")
 
     sync_max_button()
 
